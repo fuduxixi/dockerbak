@@ -1,21 +1,30 @@
-name: Backup Docker Image
+name: Backup Docker Image with Auto Version
 
 on:
-  workflow_dispatch:    # 允许手动触发
+  workflow_dispatch:
     inputs:
       source_image:
         description: '源镜像地址'
         required: true
         default: 'ghcr.io/szemeng76/lunatv:latest'
+      keep_versions:
+        description: '保留最近几个版本'
+        required: false
+        default: '3'
+  schedule:
+    - cron: '0 0 * * *'
 
 jobs:
   backup:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: 登录 GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -23,19 +32,211 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 拉取源镜像
-        run: docker pull ${{ github.event.inputs.source_image }}
-
-      - name: 重新标记镜像
+      - name: 检查镜像更新
+        id: check
         run: |
-          # 提取镜像名称（去掉前面的registry路径）
-          IMAGE_NAME=$(echo "${{ github.event.inputs.source_image }}" | sed 's|.*/||')
-          echo "TARGET_IMAGE=ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}" >> $GITHUB_ENV
-          docker tag ${{ github.event.inputs.source_image }} ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}
+          # 设置源镜像
+          SOURCE_IMAGE="${{ github.event.inputs.source_image }}"
+          if [ -z "$SOURCE_IMAGE" ]; then
+            SOURCE_IMAGE="ghcr.io/szemeng76/lunatv:latest"
+          fi
+          
+          # 提取镜像名称
+          IMAGE_NAME=$(echo "$SOURCE_IMAGE" | sed 's|.*/||' | cut -d: -f1)
+          TARGET_BASE="ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}"
+          
+          echo "SOURCE_IMAGE=$SOURCE_IMAGE" >> $GITHUB_OUTPUT
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "TARGET_BASE=$TARGET_BASE" >> $GITHUB_OUTPUT
+          
+          # 拉取源镜像
+          echo "📥 正在拉取源镜像..."
+          docker pull $SOURCE_IMAGE
+          
+          # 获取源镜像的 digest
+          SOURCE_DIGEST=$(docker inspect --format='{{.Id}}' $SOURCE_IMAGE)
+          echo "SOURCE_DIGEST=$SOURCE_DIGEST" >> $GITHUB_OUTPUT
+          echo "源镜像 ID: $SOURCE_DIGEST"
+          
+          # 创建记录目录
+          mkdir -p .backup-data
+          DIGEST_FILE=".backup-data/${IMAGE_NAME}.digest"
+          VERSION_FILE=".backup-data/${IMAGE_NAME}.version"
+          
+          echo "DIGEST_FILE=$DIGEST_FILE" >> $GITHUB_OUTPUT
+          echo "VERSION_FILE=$VERSION_FILE" >> $GITHUB_OUTPUT
+          
+          # 读取上次的 digest
+          if [ -f "$DIGEST_FILE" ]; then
+            LAST_DIGEST=$(cat "$DIGEST_FILE")
+            echo "上次镜像 ID: $LAST_DIGEST"
+          else
+            LAST_DIGEST=""
+            echo "📝 首次备份此镜像"
+          fi
+          
+          # 比较判断是否需要更新
+          if [ "$SOURCE_DIGEST" = "$LAST_DIGEST" ]; then
+            echo "NEED_UPDATE=false" >> $GITHUB_OUTPUT
+            echo "✅ 镜像内容无变化，无需更新"
+          else
+            echo "NEED_UPDATE=true" >> $GITHUB_OUTPUT
+            echo "🔄 检测到镜像有更新！"
+          fi
 
-      - name: 推送到自己的仓库
-        run: docker push ${{ env.TARGET_IMAGE }}
-
-      - name: 完成提示
+      - name: 计算新版本号
+        id: version
+        if: steps.check.outputs.NEED_UPDATE == 'true'
         run: |
-          echo "✅ 镜像已备份到: ${{ env.TARGET_IMAGE }}"
+          VERSION_FILE="${{ steps.check.outputs.VERSION_FILE }}"
+          
+          if [ -f "$VERSION_FILE" ]; then
+            CURRENT_VERSION=$(cat "$VERSION_FILE")
+            MAJOR=$(echo $CURRENT_VERSION | cut -d. -f1)
+            MINOR=$(echo $CURRENT_VERSION | cut -d. -f2)
+            NEW_MINOR=$((MINOR + 1))
+            NEW_VERSION="${MAJOR}.${NEW_MINOR}"
+          else
+            NEW_VERSION="1.0"
+          fi
+          
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "📌 新版本号: $NEW_VERSION"
+
+      - name: 打标签并推送镜像
+        if: steps.check.outputs.NEED_UPDATE == 'true'
+        run: |
+          SOURCE="${{ steps.check.outputs.SOURCE_IMAGE }}"
+          TARGET="${{ steps.check.outputs.TARGET_BASE }}"
+          VERSION="${{ steps.version.outputs.NEW_VERSION }}"
+          
+          docker tag $SOURCE ${TARGET}:${VERSION}
+          docker tag $SOURCE ${TARGET}:latest
+          
+          echo "📤 正在推送镜像..."
+          docker push ${TARGET}:${VERSION}
+          docker push ${TARGET}:latest
+          
+          echo "✅ 已推送: ${TARGET}:${VERSION}"
+          echo "✅ 已推送: ${TARGET}:latest"
+
+      - name: 清理旧版本镜像
+        if: steps.check.outputs.NEED_UPDATE == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IMAGE_NAME="${{ steps.check.outputs.IMAGE_NAME }}"
+          OWNER="${{ github.repository_owner }}"
+          
+          # 获取保留版本数
+          KEEP_VERSIONS="${{ github.event.inputs.keep_versions }}"
+          if [ -z "$KEEP_VERSIONS" ]; then
+            KEEP_VERSIONS=3
+          fi
+          
+          echo "📋 获取所有镜像版本..."
+          echo "🔒 保留最近 $KEEP_VERSIONS 个版本"
+          
+          # 获取版本列表（尝试用户端点，失败则尝试组织端点）
+          VERSIONS_JSON=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/users/${OWNER}/packages/container/${IMAGE_NAME}/versions" \
+            --paginate 2>/dev/null) || \
+          VERSIONS_JSON=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/orgs/${OWNER}/packages/container/${IMAGE_NAME}/versions" \
+            --paginate 2>/dev/null) || \
+          { echo "⚠️ 无法获取版本信息，跳过清理"; exit 0; }
+          
+          # 统计版本数
+          TOTAL=$(echo "$VERSIONS_JSON" | jq 'length')
+          echo "📦 当前共有 $TOTAL 个版本"
+          
+          if [ "$TOTAL" -le "$KEEP_VERSIONS" ]; then
+            echo "✅ 版本数量未超过保留数量，无需清理"
+            exit 0
+          fi
+          
+          # 计算需要删除的数量
+          DELETE_COUNT=$((TOTAL - KEEP_VERSIONS))
+          echo "🗑️ 将删除 $DELETE_COUNT 个旧版本"
+          
+          # 获取需要删除的版本ID（API返回按时间降序，跳过最新的几个）
+          DELETE_IDS=$(echo "$VERSIONS_JSON" | jq -r ".[$KEEP_VERSIONS:][].id")
+          
+          # 删除旧版本
+          DELETED=0
+          for VERSION_ID in $DELETE_IDS; do
+            # 获取该版本的标签
+            TAGS=$(echo "$VERSIONS_JSON" | jq -r ".[] | select(.id==$VERSION_ID) | .metadata.container.tags | join(\", \")")
+            
+            if [ -z "$TAGS" ]; then
+              TAGS="(无标签)"
+            fi
+            
+            echo "  🗑️ 删除版本 ID: $VERSION_ID (tags: $TAGS)"
+            
+            # 尝试用户端点删除
+            gh api \
+              --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/users/${OWNER}/packages/container/${IMAGE_NAME}/versions/${VERSION_ID}" 2>/dev/null || \
+            # 尝试组织端点删除
+            gh api \
+              --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/orgs/${OWNER}/packages/container/${IMAGE_NAME}/versions/${VERSION_ID}" 2>/dev/null || \
+            echo "    ⚠️ 删除失败，可能权限不足"
+            
+            DELETED=$((DELETED + 1))
+          done
+          
+          echo ""
+          echo "✅ 清理完成！已删除 $DELETED 个旧版本"
+          echo "📦 当前保留 $KEEP_VERSIONS 个最新版本"
+
+      - name: 保存版本记录
+        if: steps.check.outputs.NEED_UPDATE == 'true'
+        run: |
+          echo "${{ steps.check.outputs.SOURCE_DIGEST }}" > "${{ steps.check.outputs.DIGEST_FILE }}"
+          echo "${{ steps.version.outputs.NEW_VERSION }}" > "${{ steps.check.outputs.VERSION_FILE }}"
+          
+          # 更新历史记录（只保留最近10条）
+          HISTORY_FILE=".backup-data/${{ steps.check.outputs.IMAGE_NAME }}.history"
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - v${{ steps.version.outputs.NEW_VERSION }}" >> "$HISTORY_FILE"
+          tail -10 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+
+      - name: 提交记录到仓库
+        if: steps.check.outputs.NEED_UPDATE == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .backup-data/
+          git commit -m "🔖 Update ${{ steps.check.outputs.IMAGE_NAME }} to v${{ steps.version.outputs.NEW_VERSION }}"
+          git push
+
+      - name: 输出结果摘要
+        run: |
+          echo ""
+          echo "==========================================" 
+          if [ "${{ steps.check.outputs.NEED_UPDATE }}" = "true" ]; then
+            echo "🎉 备份完成！"
+            echo ""
+            echo "📦 镜像名称: ${{ steps.check.outputs.IMAGE_NAME }}"
+            echo "🏷️  新版本号: v${{ steps.version.outputs.NEW_VERSION }}"
+            echo "🔒 保留版本: 最近 ${{ github.event.inputs.keep_versions || '3' }} 个"
+            echo ""
+            echo "📥 使用方法:"
+            echo "   docker pull ${{ steps.check.outputs.TARGET_BASE }}:${{ steps.version.outputs.NEW_VERSION }}"
+            echo "   docker pull ${{ steps.check.outputs.TARGET_BASE }}:latest"
+          else
+            echo "ℹ️  镜像无变化，本次跳过更新"
+            echo ""
+            echo "📦 当前镜像: ${{ steps.check.outputs.TARGET_BASE }}:latest"
+          fi
+          echo "==========================================" 
